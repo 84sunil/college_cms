@@ -254,6 +254,7 @@ class Payment(models.Model):
         ('COMPLETED', 'Completed'),
         ('FAILED', 'Failed'),
         ('PARTIAL', 'Partial'),
+        ('PROCESSING', 'Processing'),
     ]
     
     PAYMENT_METHOD_CHOICES = [
@@ -262,26 +263,35 @@ class Payment(models.Model):
         ('BANK_TRANSFER', 'Bank Transfer'),
         ('CARD', 'Card'),
         ('ONLINE', 'Online'),
+        ('RAZORPAY', 'Razorpay'),
     ]
     
     student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='payments')
-    fee_structure = models.ForeignKey(FeeStructure, on_delete=models.SET_NULL, null=True, related_name='payments')
+    fee_structure = models.ForeignKey(FeeStructure, on_delete=models.SET_NULL, null=True, blank=True, related_name='payments')
     amount_due = models.DecimalField(max_digits=10, decimal_places=2)
     amount_paid = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    payment_date = models.DateField()
+    payment_date = models.DateField(null=True, blank=True)  # Set when payment completes
     due_date = models.DateField()
     status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='PENDING')
-    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES)
-    transaction_id = models.CharField(max_length=50, unique=True, null=True, blank=True)
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, default='ONLINE')
+    transaction_id = models.CharField(max_length=100, unique=True, null=True, blank=True)
     remarks = models.TextField(blank=True, null=True)
+    # Razorpay-specific fields
+    razorpay_order_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
+    razorpay_payment_id = models.CharField(max_length=100, null=True, blank=True)
+    razorpay_signature = models.CharField(max_length=200, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-payment_date']
+        ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.student.roll_number} - Rs.{self.amount_paid}"
+        return f"{self.student.roll_number} - Rs.{self.amount_due} ({self.status})"
+
+    @property
+    def balance_due(self):
+        return self.amount_due - self.amount_paid
 
 
 # ============= LIBRARY MANAGEMENT MODEL =============

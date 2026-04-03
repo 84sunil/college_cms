@@ -4,132 +4,134 @@ const API_BASE_URL = 'http://localhost:8000/college/api';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: { 'Content-Type': 'application/json' },
 });
 
-// Add token to requests
+// ── Attach JWT to every request ──
 apiClient.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token');
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
+  if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
 
-// Handle token refresh on 401
+// ── Auto-refresh on 401 ──
 apiClient.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config;
-
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
-
       try {
         const refreshToken = localStorage.getItem('refresh_token');
-        const response = await axios.post(
-          `${API_BASE_URL}/auth/token/refresh/`,
-          { refresh: refreshToken }
-        );
-
-        localStorage.setItem('access_token', response.data.access);
-        originalRequest.headers.Authorization = `Bearer ${response.data.access}`;
+        const res = await axios.post(`${API_BASE_URL}/auth/token/refresh/`, { refresh: refreshToken });
+        localStorage.setItem('access_token', res.data.access);
+        originalRequest.headers.Authorization = `Bearer ${res.data.access}`;
         return apiClient(originalRequest);
-      } catch (refreshError) {
+      } catch {
         localStorage.removeItem('access_token');
         localStorage.removeItem('refresh_token');
         window.location.href = '/login';
-        return Promise.reject(refreshError);
       }
     }
-
     return Promise.reject(error);
   }
 );
 
-// Authentication endpoints
+// ── Auth ──
 export const auth = {
-  register: (userData) => apiClient.post('/auth/register/', userData),
-  login: (credentials) => apiClient.post('/auth/login/', credentials),
-  facultyLogin: (credentials) => apiClient.post('/auth/faculty-login/', credentials),
-  studentLogin: (credentials) => apiClient.post('/auth/student-login/', credentials),
-  adminLogin: (credentials) => apiClient.post('/auth/admin-login/', credentials),
-  logout: (refreshToken) => apiClient.post('/auth/logout/', { refresh: refreshToken }),
+  register: (data) => apiClient.post('/auth/register/', data),
+  login: (data) => apiClient.post('/auth/login/', data),
+  facultyLogin: (data) => apiClient.post('/auth/faculty-login/', data),
+  studentLogin: (data) => apiClient.post('/auth/student-login/', data),
+  adminLogin: (data) => apiClient.post('/auth/admin-login/', data),
+  logout: (refresh) => apiClient.post('/auth/logout/', { refresh }),
   getCurrentUser: () => apiClient.get('/auth/current-user/'),
-  changePassword: (passwordData) => apiClient.post('/auth/change-password/', passwordData),
+  changePassword: (data) => apiClient.post('/auth/change-password/', data),
   forgotPassword: (email) => apiClient.post('/auth/forgot-password/', { email }),
   resetPassword: (token, password, email) => apiClient.post('/auth/reset-password/', { token, password, email }),
   getRegistrationOptions: () => apiClient.get('/auth/registration-options/'),
   getDepartmentsList: () => apiClient.get('/auth/departments-list/'),
 };
 
-// Helper function for file uploads with multipart/form-data
-const uploadWithFile = async (url, formData) => {
+// ── File upload helper ──
+const uploadWithFile = (url, formData) => {
   const token = localStorage.getItem('access_token');
-  return axios.put(url, formData, {
-    baseURL: API_BASE_URL,
-    headers: {
-      'Content-Type': 'multipart/form-data',
-      Authorization: token ? `Bearer ${token}` : undefined,
-    },
+  return axios.put(`${API_BASE_URL}${url}`, formData, {
+    headers: { 'Content-Type': 'multipart/form-data', Authorization: token ? `Bearer ${token}` : undefined },
   });
 };
 
-// Students endpoints
+// ── Students ──
 export const students = {
-  list: (page = 1) => apiClient.get('/students/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/students/', { params }),
   detail: (id) => apiClient.get(`/students/${id}/`),
   create: (data) => apiClient.post('/students/', data),
   update: (id, data) => apiClient.put(`/students/${id}/`, data),
-  updateWithFile: (id, formData) => uploadWithFile(`${API_BASE_URL}/students/${id}/`, formData),
+  patch: (id, data) => apiClient.patch(`/students/${id}/`, data),
+  updateWithFile: (id, formData) => uploadWithFile(`/students/${id}/`, formData),
   delete: (id) => apiClient.delete(`/students/${id}/`),
   addStudent: (data) => apiClient.post('/students/add-student/', data),
+  myProfile: () => apiClient.get('/students/my_profile/'),
+  feeSummary: () => apiClient.get('/students/fee_summary/'),
 };
 
-// Faculty endpoints
+// ── Faculty ──
 export const faculty = {
-  list: (page = 1) => apiClient.get('/faculty/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/faculty/', { params }),
   detail: (id) => apiClient.get(`/faculty/${id}/`),
   create: (data) => apiClient.post('/faculty/', data),
   update: (id, data) => apiClient.put(`/faculty/${id}/`, data),
-  updateWithFile: (id, formData) => uploadWithFile(`${API_BASE_URL}/faculty/${id}/`, formData),
+  patch: (id, data) => apiClient.patch(`/faculty/${id}/`, data),
+  updateWithFile: (id, formData) => uploadWithFile(`/faculty/${id}/`, formData),
   delete: (id) => apiClient.delete(`/faculty/${id}/`),
+  myProfile: () => apiClient.get('/faculty/my_profile/'),
 };
 
-// Courses endpoints
+// ── Courses ──
 export const courses = {
-  list: (page = 1) => apiClient.get('/courses/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/courses/', { params }),
   detail: (id) => apiClient.get(`/courses/${id}/`),
   create: (data) => apiClient.post('/courses/', data),
   update: (id, data) => apiClient.put(`/courses/${id}/`, data),
   delete: (id) => apiClient.delete(`/courses/${id}/`),
 };
 
-// Departments endpoints
+// ── Departments ──
 export const departments = {
-  list: (page = 1) => apiClient.get('/departments/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/departments/', { params }),
   detail: (id) => apiClient.get(`/departments/${id}/`),
   create: (data) => apiClient.post('/departments/', data),
   update: (id, data) => apiClient.put(`/departments/${id}/`, data),
   delete: (id) => apiClient.delete(`/departments/${id}/`),
 };
 
-// Payments endpoints
+// ── Fee Structures ──
+export const feeStructures = {
+  list: (params = {}) => apiClient.get('/fee-structures/', { params }),
+  detail: (id) => apiClient.get(`/fee-structures/${id}/`),
+  create: (data) => apiClient.post('/fee-structures/', data),
+  update: (id, data) => apiClient.put(`/fee-structures/${id}/`, data),
+  delete: (id) => apiClient.delete(`/fee-structures/${id}/`),
+};
+
+// ── Payments ──
 export const payments = {
-  list: (page = 1) => apiClient.get('/payments/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/payments/', { params }),
   detail: (id) => apiClient.get(`/payments/${id}/`),
   create: (data) => apiClient.post('/payments/', data),
   update: (id, data) => apiClient.put(`/payments/${id}/`, data),
+  patch: (id, data) => apiClient.patch(`/payments/${id}/`, data),
   delete: (id) => apiClient.delete(`/payments/${id}/`),
   myPayments: () => apiClient.get('/payments/my_payments/'),
-  sendNotification: (id, data) => apiClient.post(`/payments/${id}/send-notification/`, data),
+  createOrder: (id) => apiClient.post(`/payments/${id}/create_razorpay_order/`),
+  verifyPayment: (id, data) => apiClient.post(`/payments/${id}/verify_payment/`, data),
+  sendNotification: (id, data) => apiClient.post(`/payments/${id}/send_notification/`, data),
+  bulkCreate: (data) => apiClient.post('/payments/bulk_create/', data),
 };
 
-// Grades endpoints
+// ── Grades ──
 export const grades = {
-  list: (page = 1) => apiClient.get('/grades/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/grades/', { params }),
   detail: (id) => apiClient.get(`/grades/${id}/`),
   create: (data) => apiClient.post('/grades/', data),
   update: (id, data) => apiClient.put(`/grades/${id}/`, data),
@@ -137,55 +139,27 @@ export const grades = {
   myGrades: () => apiClient.get('/grades/my_grades/'),
 };
 
+// ── Attendance ──
 export const attendance = {
-  list: (page = 1) => apiClient.get('/attendance/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/attendance/', { params }),
   create: (data) => apiClient.post('/attendance/', data),
+  update: (id, data) => apiClient.put(`/attendance/${id}/`, data),
+  delete: (id) => apiClient.delete(`/attendance/${id}/`),
   myAttendance: () => apiClient.get('/attendance/my_attendance/'),
 };
 
+// ── Assignments ──
 export const assignments = {
-  list: (page = 1) => apiClient.get('/assignments/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/assignments/', { params }),
   create: (data) => apiClient.post('/assignments/', data),
   update: (id, data) => apiClient.put(`/assignments/${id}/`, data),
   delete: (id) => apiClient.delete(`/assignments/${id}/`),
   myCourseAssignments: () => apiClient.get('/assignments/my_course_assignments/'),
 };
 
-export const notifications = {
-  list: (page = 1) => apiClient.get('/notifications/', { params: { page } }),
-  create: (data) => apiClient.post('/notifications/', data),
-  delete: (id) => apiClient.delete(`/notifications/${id}/`),
-  myNotifications: () => apiClient.get('/notifications/my_notifications/'),
-};
-
-export const enrollments = {
-  list: (page = 1) => apiClient.get('/course-enrollments/', { params: { page } }),
-  myEnrollments: () => apiClient.get('/course-enrollments/my_enrollments/'),
-};
-
-// Dashboard stats endpoint
-export const stats = {
-  getCounts: () => apiClient.get('/stats/'),
-};
-
-// Timetable endpoints
-export const timetable = {
-  list: (page = 1) => apiClient.get('/timetable/', { params: { page } }),
-  detail: (id) => apiClient.get(`/timetable/${id}/`),
-  create: (data) => apiClient.post('/timetable/', data),
-  update: (id, data) => apiClient.put(`/timetable/${id}/`, data),
-  delete: (id) => apiClient.delete(`/timetable/${id}/`),
-  byCourse: (courseId) => apiClient.get(`/timetable/?course=${courseId}`),
-};
-
-// Attendance endpoints with semester filtering
-export const attendanceBySemester = {
-  list: (semester) => apiClient.get('/attendance/by-semester/', { params: { semester } }),
-};
-
-// Assignment Submission endpoints
+// ── Assignment Submissions ──
 export const assignmentSubmissions = {
-  list: (page = 1) => apiClient.get('/assignment-submissions/', { params: { page } }),
+  list: (params = {}) => apiClient.get('/assignment-submissions/', { params }),
   detail: (id) => apiClient.get(`/assignment-submissions/${id}/`),
   create: (data) => apiClient.post('/assignment-submissions/', data),
   update: (id, data) => apiClient.put(`/assignment-submissions/${id}/`, data),
@@ -194,6 +168,40 @@ export const assignmentSubmissions = {
   courseSubmissions: () => apiClient.get('/assignment-submissions/course_submissions/'),
   approveSubmission: (id, data) => apiClient.post(`/assignment-submissions/${id}/approve_submission/`, data),
   rejectSubmission: (id, data) => apiClient.post(`/assignment-submissions/${id}/reject_submission/`, data),
+};
+
+// ── Notifications ──
+export const notifications = {
+  list: (params = {}) => apiClient.get('/notifications/', { params }),
+  create: (data) => apiClient.post('/notifications/', data),
+  delete: (id) => apiClient.delete(`/notifications/${id}/`),
+  myNotifications: () => apiClient.get('/notifications/my_notifications/'),
+  markRead: (id) => apiClient.post(`/notifications/${id}/mark_read/`),
+};
+
+// ── Enrollments ──
+export const enrollments = {
+  list: (params = {}) => apiClient.get('/course-enrollments/', { params }),
+  myEnrollments: () => apiClient.get('/course-enrollments/my_enrollments/'),
+};
+
+// ── Timetable ──
+export const timetable = {
+  list: (params = {}) => apiClient.get('/timetable/', { params }),
+  detail: (id) => apiClient.get(`/timetable/${id}/`),
+  create: (data) => apiClient.post('/timetable/', data),
+  update: (id, data) => apiClient.put(`/timetable/${id}/`, data),
+  delete: (id) => apiClient.delete(`/timetable/${id}/`),
+};
+
+// ── Stats ──
+export const stats = {
+  getCounts: () => apiClient.get('/stats/'),
+};
+
+// ── Attendance by semester ──
+export const attendanceBySemester = {
+  list: (semester) => apiClient.get('/attendance/by-semester/', { params: { semester } }),
 };
 
 export default apiClient;

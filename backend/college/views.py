@@ -1,16 +1,22 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
-from django.utils.encoding import force_bytes, force_str
+from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.conf import settings
 from django.shortcuts import render
-from django.http import HttpResponse
+from django.db import transaction
+from django.utils import timezone
+import razorpay
+import hmac
+import hashlib
+import uuid
+from datetime import date, timedelta
 from .models import (
     Department, Faculty, Course, Student, CourseEnrollment,
     Admission, Attendance, Grade, FeeStructure, Payment,
@@ -21,6 +27,7 @@ from .serializers import (
     DepartmentSerializer, FacultySerializer, CourseSerializer, StudentSerializer,
     CourseEnrollmentSerializer, AdmissionSerializer, AttendanceSerializer,
     GradeSerializer, FeeStructureSerializer, PaymentSerializer,
+    RazorpayOrderSerializer, PaymentVerifySerializer,
     BookSerializer, BookIssueSerializer, HostelSerializer, RoomSerializer,
     HostelAllocationSerializer, HostelFeeSerializer, UserCreateSerializer,
     LoginSerializer, LogoutSerializer, AssignmentSerializer, AssignmentSubmissionSerializer,
@@ -29,34 +36,31 @@ from .serializers import (
 from .permissions import IsAdmin, IsFaculty, IsStudent, IsAdminOrFacultyOrStudent
 
 
-# ============= HELPER FUNCTION =============
+# ============= RAZORPAY CLIENT =============
+def get_razorpay_client():
+    return razorpay.Client(
+        auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+    )
+
+
+# ============= HELPER FUNCTIONS =============
 def get_user_role(user):
-    """
-    Determine user role based on profiles
-    Returns: 'admin', 'faculty', 'student', or 'user'
-    """
     if user.is_staff and user.is_superuser:
         return 'admin'
-    
     try:
         Faculty.objects.get(user=user)
         return 'faculty'
     except Faculty.DoesNotExist:
         pass
-    
     try:
         Student.objects.get(user=user)
         return 'student'
     except Student.DoesNotExist:
         pass
-    
     return 'user'
 
 
 def get_user_response_data(user):
-    """
-    Get comprehensive user response data including role and profile info
-    """
     role = get_user_role(user)
     response_data = {
         'user_id': user.id,
@@ -68,31 +72,31 @@ def get_user_response_data(user):
         'role': role,
         'is_active': user.is_active,
     }
-    
-    # Add role-specific data
     if role == 'faculty':
         try:
             faculty = Faculty.objects.get(user=user)
-            response_data['faculty_id'] = faculty.id
-            response_data['employee_id'] = faculty.employee_id
-            response_data['department'] = faculty.department.name if faculty.department else None
-            response_data['specialization'] = faculty.specialization
+            response_data.update({
+                'faculty_id': faculty.id,
+                'employee_id': faculty.employee_id,
+                'department': faculty.department.name if faculty.department else None,
+                'specialization': faculty.specialization,
+            })
         except Faculty.DoesNotExist:
             pass
-    
     elif role == 'student':
         try:
             student = Student.objects.get(user=user)
-            response_data['student_id'] = student.id
-            response_data['roll_number'] = student.roll_number
-            response_data['enrollment_number'] = student.enrollment_number
-            response_data['department'] = student.department.name if student.department else None
-            response_data['semester'] = student.semester
-            response_data['status'] = student.status
-            response_data['cgpa'] = float(student.cgpa)
+            response_data.update({
+                'student_id': student.id,
+                'roll_number': student.roll_number,
+                'enrollment_number': student.enrollment_number,
+                'department': student.department.name if student.department else None,
+                'semester': student.semester,
+                'status': student.status,
+                'cgpa': float(student.cgpa),
+            })
         except Student.DoesNotExist:
             pass
-    
     return response_data
 
 
@@ -100,635 +104,237 @@ def get_user_response_data(user):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def user_register(request):
-    """User registration endpoint with JWT tokens and role-specific profile creation"""
-    if request.method == 'POST':
-        role = request.data.get('role', 'user')
-        
-        # Validate role
-        if role not in ['user', 'student', 'faculty', 'admin']:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid role. Must be: user, student, faculty, or admin'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        serializer = UserCreateSerializer(data=request.data)
-        if serializer.is_valid():
+    """User registration with JWT tokens and role-specific profile creation"""
+    role = request.data.get('role', 'user')
+    if role not in ['user', 'student', 'faculty', 'admin']:
+        return Response({'success': False, 'message': 'Invalid role.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = UserCreateSerializer(data=request.data)
+    if serializer.is_valid():
+        with transaction.atomic():
             user = serializer.save()
-            
-            # Set admin privileges
             if role == 'admin':
                 user.is_staff = True
                 user.is_superuser = True
                 user.save()
-            
-            # Create role-specific profile
             elif role == 'student':
-                # Get required student fields
                 department_id = request.data.get('department')
                 if not department_id:
-                    user.delete()  # Clean up user if profile creation fails
-                    return Response(
-                        {
-                            'success': False,
-                            'message': 'Department is required for student registration'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                
-                try:
-                    if str(department_id).isdigit():
-                        department = Department.objects.get(id=int(department_id))
-                    else:
-                        department = Department.objects.filter(name__iexact=department_id).first()
-                        if not department:
-                            department = Department.objects.create(
-                                name=department_id,
-                                code=department_id[:10].upper()
-                            )
-                            
-                    Student.objects.create(
-                        user=user,
-                        department=department,
-                        roll_number=request.data.get('roll_number', ''),
-                        enrollment_number=request.data.get('enrollment_number', ''),
-                        semester=request.data.get('semester', 1),
-                        status='ACTIVE'
-                    )
-                except Department.DoesNotExist:
-                    user.delete()
-                    return Response(
-                        {
-                            'success': False,
-                            'message': 'Invalid department selected'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                except Exception as e:
-                    user.delete()
-                    return Response(
-                        {
-                            'success': False,
-                            'message': f'Failed to create student profile: {str(e)}'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            
+                    raise ValueError('Department is required for student registration')
+                if str(department_id).isdigit():
+                    department = Department.objects.get(id=int(department_id))
+                else:
+                    department = Department.objects.filter(name__iexact=department_id).first()
+                    if not department:
+                        department = Department.objects.create(name=department_id, code=department_id[:10].upper())
+                Student.objects.create(
+                    user=user,
+                    department=department,
+                    roll_number=request.data.get('roll_number', ''),
+                    enrollment_number=request.data.get('enrollment_number', ''),
+                    semester=request.data.get('semester', 1),
+                    status='ACTIVE'
+                )
             elif role == 'faculty':
-                # Get required faculty fields
                 department_id = request.data.get('department')
                 if not department_id:
-                    user.delete()
-                    return Response(
-                        {
-                            'success': False,
-                            'message': 'Department is required for faculty registration'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                
-                try:
-                    if str(department_id).isdigit():
-                        department = Department.objects.get(id=int(department_id))
-                    else:
-                        department = Department.objects.filter(name__iexact=department_id).first()
-                        if not department:
-                            department = Department.objects.create(
-                                name=department_id,
-                                code=department_id[:10].upper()
-                            )
-                            
-                    Faculty.objects.create(
-                        user=user,
-                        department=department,
-                        employee_id=request.data.get('employee_id', ''),
-                        specialization=request.data.get('specialization', '')
-                    )
-                except Department.DoesNotExist:
-                    user.delete()
-                    return Response(
-                        {
-                            'success': False,
-                            'message': 'Invalid department selected'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-                except Exception as e:
-                    user.delete()
-                    return Response(
-                        {
-                            'success': False,
-                            'message': f'Failed to create faculty profile: {str(e)}'
-                        },
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            
-            # Generate JWT tokens
-            refresh = RefreshToken.for_user(user)
-            return Response(
-                {
-                    'success': True,
-                    'message': f'{role.title()} registered successfully',
-                    'user': get_user_response_data(user),
-                    'tokens': {
-                        'access': str(refresh.access_token),
-                        'refresh': str(refresh)
-                    }
-                },
-                status=status.HTTP_201_CREATED
-            )
-        
-        return Response(
-            {
-                'success': False,
-                'errors': serializer.errors
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
+                    raise ValueError('Department is required for faculty registration')
+                if str(department_id).isdigit():
+                    department = Department.objects.get(id=int(department_id))
+                else:
+                    department = Department.objects.filter(name__iexact=department_id).first()
+                    if not department:
+                        department = Department.objects.create(name=department_id, code=department_id[:10].upper())
+                Faculty.objects.create(
+                    user=user,
+                    department=department,
+                    employee_id=request.data.get('employee_id', ''),
+                    specialization=request.data.get('specialization', '')
+                )
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'success': True,
+            'message': f'{role.title()} registered successfully',
+            'user': get_user_response_data(user),
+            'tokens': {'access': str(refresh.access_token), 'refresh': str(refresh)}
+        }, status=status.HTTP_201_CREATED)
+
+    return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def login_view(request):
-    """
-    Login endpoint for all users (Admin, Faculty, Students)
-    Returns user role and profile information
-    """
-    if request.method == 'POST':
-        username = request.data.get('username')
-        password = request.data.get('password')
-
-        if not username or not password:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Username and password are required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        user = authenticate(username=username, password=password)
-        if user is None:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid username or password'
-                },
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        if not user.is_active:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User account is disabled'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        refresh = RefreshToken.for_user(user)
-        
-        return Response(
-            {
-                'success': True,
-                'message': f'Login successful as {get_user_role(user)}',
-                'tokens': {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh)
-                },
-                'user': get_user_response_data(user)
-            },
-            status=status.HTTP_200_OK
-        )
+    username = request.data.get('username')
+    password = request.data.get('password')
+    if not username or not password:
+        return Response({'success': False, 'message': 'Username and password are required'}, status=400)
+    user = authenticate(username=username, password=password)
+    if user is None:
+        return Response({'success': False, 'message': 'Invalid username or password'}, status=401)
+    if not user.is_active:
+        return Response({'success': False, 'message': 'User account is disabled'}, status=403)
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'success': True,
+        'message': f'Login successful as {get_user_role(user)}',
+        'tokens': {'access': str(refresh.access_token), 'refresh': str(refresh)},
+        'user': get_user_response_data(user)
+    })
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def faculty_login(request):
-    """
-    Login endpoint specifically for faculty members
-    """
-    if request.method == 'POST':
-        username = request.data.get('username')
-        password = request.data.get('password')
-
-        if not username or not password:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Username and password are required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        user = authenticate(username=username, password=password)
-        if user is None:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid credentials'
-                },
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # Check if user is faculty
-        try:
-            faculty = Faculty.objects.get(user=user)
-        except Faculty.DoesNotExist:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User is not registered as faculty'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        if not user.is_active:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User account is disabled'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        refresh = RefreshToken.for_user(user)
-
-        return Response(
-            {
-                'success': True,
-                'message': 'Faculty login successful',
-                'tokens': {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh)
-                },
-                'user': get_user_response_data(user)
-            },
-            status=status.HTTP_200_OK
-        )
+    username, password = request.data.get('username'), request.data.get('password')
+    if not username or not password:
+        return Response({'success': False, 'message': 'Credentials required'}, status=400)
+    user = authenticate(username=username, password=password)
+    if user is None:
+        return Response({'success': False, 'message': 'Invalid credentials'}, status=401)
+    try:
+        Faculty.objects.get(user=user)
+    except Faculty.DoesNotExist:
+        return Response({'success': False, 'message': 'Not a faculty member'}, status=403)
+    if not user.is_active:
+        return Response({'success': False, 'message': 'Account disabled'}, status=403)
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'success': True, 'message': 'Faculty login successful',
+        'tokens': {'access': str(refresh.access_token), 'refresh': str(refresh)},
+        'user': get_user_response_data(user)
+    })
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def student_login(request):
-    """
-    Login endpoint specifically for students
-    """
-    if request.method == 'POST':
-        username = request.data.get('username')
-        password = request.data.get('password')
-
-        if not username or not password:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Username and password are required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        user = authenticate(username=username, password=password)
-        if user is None:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid credentials'
-                },
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # Check if user is student
-        try:
-            student = Student.objects.get(user=user)
-        except Student.DoesNotExist:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User is not registered as student'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        if not user.is_active:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User account is disabled'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        refresh = RefreshToken.for_user(user)
-
-        return Response(
-            {
-                'success': True,
-                'message': 'Student login successful',
-                'tokens': {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh)
-                },
-                'user': get_user_response_data(user)
-            },
-            status=status.HTTP_200_OK
-        )
+    username, password = request.data.get('username'), request.data.get('password')
+    if not username or not password:
+        return Response({'success': False, 'message': 'Credentials required'}, status=400)
+    user = authenticate(username=username, password=password)
+    if user is None:
+        return Response({'success': False, 'message': 'Invalid credentials'}, status=401)
+    try:
+        Student.objects.get(user=user)
+    except Student.DoesNotExist:
+        return Response({'success': False, 'message': 'Not a student'}, status=403)
+    if not user.is_active:
+        return Response({'success': False, 'message': 'Account disabled'}, status=403)
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'success': True, 'message': 'Student login successful',
+        'tokens': {'access': str(refresh.access_token), 'refresh': str(refresh)},
+        'user': get_user_response_data(user)
+    })
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def admin_login(request):
-    """
-    Login endpoint specifically for admin/staff members
-    """
-    if request.method == 'POST':
-        username = request.data.get('username')
-        password = request.data.get('password')
-
-        if not username or not password:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Username and password are required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        user = authenticate(username=username, password=password)
-        if user is None:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid credentials'
-                },
-                status=status.HTTP_401_UNAUTHORIZED
-            )
-
-        # Check if user is admin/staff
-        if not user.is_staff:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User does not have admin privileges'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        if not user.is_active:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'User account is disabled'
-                },
-                status=status.HTTP_403_FORBIDDEN
-            )
-
-        refresh = RefreshToken.for_user(user)
-
-        return Response(
-            {
-                'success': True,
-                'message': 'Admin login successful',
-                'tokens': {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh)
-                },
-                'user': get_user_response_data(user)
-            },
-            status=status.HTTP_200_OK
-        )
+    username, password = request.data.get('username'), request.data.get('password')
+    if not username or not password:
+        return Response({'success': False, 'message': 'Credentials required'}, status=400)
+    user = authenticate(username=username, password=password)
+    if user is None:
+        return Response({'success': False, 'message': 'Invalid credentials'}, status=401)
+    if not user.is_staff:
+        return Response({'success': False, 'message': 'Admin privileges required'}, status=403)
+    if not user.is_active:
+        return Response({'success': False, 'message': 'Account disabled'}, status=403)
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'success': True, 'message': 'Admin login successful',
+        'tokens': {'access': str(refresh.access_token), 'refresh': str(refresh)},
+        'user': get_user_response_data(user)
+    })
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
-    """
-    Logout endpoint for all authenticated users.
-    JWT tokens are stateless, so logout is handled by client removing the token.
-    With token blacklist enabled in settings, expired tokens are automatically managed.
-    """
     try:
-        # Extract refresh token from request
         refresh_token = request.data.get('refresh')
         if refresh_token:
             token = RefreshToken(refresh_token)
             token.blacklist()
-        
-        return Response(
-            {
-                'success': True,
-                'message': 'Logout successful'
-            },
-            status=status.HTTP_200_OK
-        )
-    except Exception as e:
-        return Response(
-            {
-                'success': False,
-                'message': 'Logout failed or token already invalid'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'success': True, 'message': 'Logout successful'})
+    except Exception:
+        return Response({'success': False, 'message': 'Logout failed'}, status=400)
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_current_user(request):
-    """
-    Get current authenticated user profile
-    """
-    return Response(
-        {
-            'success': True,
-            'user': get_user_response_data(request.user)
-        },
-        status=status.HTTP_200_OK
-    )
+    return Response({'success': True, 'user': get_user_response_data(request.user)})
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def change_password(request):
-    """
-    Change password for authenticated user
-    """
-    old_password = request.data.get('old_password')
-    new_password = request.data.get('new_password')
-    new_password2 = request.data.get('new_password2')
-
-    if not old_password or not new_password or not new_password2:
-        return Response(
-            {
-                'success': False,
-                'message': 'All fields are required'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    if new_password != new_password2:
-        return Response(
-            {
-                'success': False,
-                'message': 'New passwords do not match'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    if not request.user.check_password(old_password):
-        return Response(
-            {
-                'success': False,
-                'message': 'Old password is incorrect'
-            },
-            status=status.HTTP_401_UNAUTHORIZED
-        )
-
-    request.user.set_password(new_password)
+    old_pw = request.data.get('old_password')
+    new_pw = request.data.get('new_password')
+    new_pw2 = request.data.get('new_password2')
+    if not all([old_pw, new_pw, new_pw2]):
+        return Response({'success': False, 'message': 'All fields required'}, status=400)
+    if new_pw != new_pw2:
+        return Response({'success': False, 'message': 'New passwords do not match'}, status=400)
+    if not request.user.check_password(old_pw):
+        return Response({'success': False, 'message': 'Old password is incorrect'}, status=401)
+    request.user.set_password(new_pw)
     request.user.save()
-
-    return Response(
-        {
-            'success': True,
-            'message': 'Password changed successfully'
-        },
-        status=status.HTTP_200_OK
-    )
+    return Response({'success': True, 'message': 'Password changed successfully'})
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def forgot_password(request):
-    """
-    Forgot password endpoint. Sends a password reset link to the user's email.
-    """
     email = request.data.get('email')
-    
     if not email:
-        return Response(
-            {
-                'success': False,
-                'message': 'Email is required'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
+        return Response({'success': False, 'message': 'Email is required'}, status=400)
     try:
         user = User.objects.get(email=email)
-    except User.DoesNotExist:
-        # Don't reveal if email exists in the system for security
-        return Response(
-            {
-                'success': True,
-                'message': 'If an account with this email exists, a password reset link has been sent.'
-            },
-            status=status.HTTP_200_OK
-        )
-    
-    # Generate password reset token
-    token_generator = PasswordResetTokenGenerator()
-    token = token_generator.make_token(user)
-    uid = urlsafe_base64_encode(force_bytes(user.pk))
-    
-    # In production, send email with reset link
-    # For now, we'll return the token and uid for demonstration
-    # Email should be sent like: 
-    # reset_link = f"http://yourfrontend.com/reset-password/{token}?uid={uid}"
-    
-    return Response(
-        {
+        token_generator = PasswordResetTokenGenerator()
+        token = token_generator.make_token(user)
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        return Response({
             'success': True,
             'message': 'Password reset link sent to your email',
-            'token': token,  # You can remove this in production
-            'uid': uid  # You can remove this in production
-        },
-        status=status.HTTP_200_OK
-    )
+            'token': token,
+            'uid': uid
+        })
+    except User.DoesNotExist:
+        return Response({'success': True, 'message': 'If an account exists, reset link was sent.'})
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def reset_password(request):
-    """
-    Reset password endpoint. Validates the token and updates the password.
-    """
     token = request.data.get('token')
     password = request.data.get('password')
     email = request.data.get('email')
-    
-    if not token or not password or not email:
-        return Response(
-            {
-                'success': False,
-                'message': 'Token, email, and password are required'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
+    if not all([token, password, email]):
+        return Response({'success': False, 'message': 'Token, email and password required'}, status=400)
     if len(password) < 8:
-        return Response(
-            {
-                'success': False,
-                'message': 'Password must be at least 8 characters long'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
+        return Response({'success': False, 'message': 'Password must be at least 8 characters'}, status=400)
     try:
-        # Get user by email
         user = User.objects.get(email=email)
-        
-        # Validate token
         token_generator = PasswordResetTokenGenerator()
         if not token_generator.check_token(user, token):
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid or expired reset token'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Update password
+            return Response({'success': False, 'message': 'Invalid or expired token'}, status=400)
         user.set_password(password)
         user.save()
-        
-        return Response(
-            {
-                'success': True,
-                'message': 'Password reset successfully. You can now login with your new password.'
-            },
-            status=status.HTTP_200_OK
-        )
-    
+        return Response({'success': True, 'message': 'Password reset successfully'})
     except User.DoesNotExist:
-        # Don't reveal if email exists in the system
-        return Response(
-            {
-                'success': False,
-                'message': 'Invalid or expired reset token'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    except Exception as e:
-        return Response(
-            {
-                'success': False,
-                'message': f'Failed to reset password: {str(e)}'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'success': False, 'message': 'Invalid request'}, status=400)
 
 
-# ============= WEB VIEW =============
 def home(request):
-    """Home page view"""
     return render(request, 'home.html')
 
 
 # ============= DEPARTMENT VIEWSET =============
 class DepartmentViewSet(viewsets.ModelViewSet):
-    """ViewSet for Department model"""
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
     permission_classes = [IsAuthenticated]
@@ -739,8 +345,7 @@ class DepartmentViewSet(viewsets.ModelViewSet):
 
 # ============= FACULTY VIEWSET =============
 class FacultyViewSet(viewsets.ModelViewSet):
-    """ViewSet for Faculty model"""
-    queryset = Faculty.objects.all()
+    queryset = Faculty.objects.select_related('user', 'department').all()
     serializer_class = FacultySerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['department', 'is_active']
@@ -749,19 +354,16 @@ class FacultyViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def my_profile(self, request):
-        """Get current faculty's profile"""
         try:
             faculty = Faculty.objects.get(user=request.user)
-            serializer = self.get_serializer(faculty)
-            return Response(serializer.data)
+            return Response(self.get_serializer(faculty).data)
         except Faculty.DoesNotExist:
-            return Response({'detail': 'Faculty profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Faculty profile not found'}, status=404)
 
 
 # ============= COURSE VIEWSET =============
 class CourseViewSet(viewsets.ModelViewSet):
-    """ViewSet for Course model"""
-    queryset = Course.objects.all()
+    queryset = Course.objects.select_related('department', 'instructor__user').all()
     serializer_class = CourseSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['department', 'semester', 'is_active']
@@ -771,8 +373,7 @@ class CourseViewSet(viewsets.ModelViewSet):
 
 # ============= STUDENT VIEWSET =============
 class StudentViewSet(viewsets.ModelViewSet):
-    """ViewSet for Student model"""
-    queryset = Student.objects.all()
+    queryset = Student.objects.select_related('user', 'department').all()
     serializer_class = StudentSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['department', 'semester', 'status', 'is_active']
@@ -781,52 +382,64 @@ class StudentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def my_profile(self, request):
-        """Get current student's profile"""
         try:
             student = Student.objects.get(user=request.user)
-            serializer = self.get_serializer(student)
-            return Response(serializer.data)
+            return Response(self.get_serializer(student).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Student profile not found'}, status=404)
+
+    @action(detail=False, methods=['get'])
+    def fee_summary(self, request):
+        """Get fee summary for current student"""
+        try:
+            student = Student.objects.get(user=request.user)
+            payments = Payment.objects.filter(student=student)
+            total_due = sum(p.amount_due for p in payments)
+            total_paid = sum(p.amount_paid for p in payments)
+            pending_count = payments.filter(status='PENDING').count()
+            return Response({
+                'success': True,
+                'summary': {
+                    'total_due': float(total_due),
+                    'total_paid': float(total_paid),
+                    'balance': float(total_due - total_paid),
+                    'pending_count': pending_count,
+                }
+            })
+        except Student.DoesNotExist:
+            return Response({'detail': 'Student profile not found'}, status=404)
 
 
 # ============= COURSE ENROLLMENT VIEWSET =============
 class CourseEnrollmentViewSet(viewsets.ModelViewSet):
-    """ViewSet for CourseEnrollment model"""
-    queryset = CourseEnrollment.objects.all()
+    queryset = CourseEnrollment.objects.select_related('student', 'course').all()
     serializer_class = CourseEnrollmentSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'course', 'status']
     search_fields = ['student__roll_number', 'course__code', 'course__name']
-    ordering_fields = ['enrollment_date', 'status']
 
     @action(detail=False, methods=['get'])
     def my_enrollments(self, request):
-        """Get current student's course enrollments"""
         try:
             student = Student.objects.get(user=request.user)
             enrollments = CourseEnrollment.objects.filter(student=student)
-            serializer = self.get_serializer(enrollments, many=True)
-            return Response(serializer.data)
+            return Response(self.get_serializer(enrollments, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Student profile not found'}, status=404)
 
 
 # ============= ADMISSION VIEWSET =============
 class AdmissionViewSet(viewsets.ModelViewSet):
-    """ViewSet for Admission model"""
     queryset = Admission.objects.all()
     serializer_class = AdmissionSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['status', 'eligibility']
-    search_fields = ['student__roll_number', 'student__user__first_name', 'student__user__last_name']
-    ordering_fields = ['application_date', 'entrance_score', 'status']
+    search_fields = ['student__roll_number', 'student__user__first_name']
 
 
 # ============= ATTENDANCE VIEWSET =============
 class AttendanceViewSet(viewsets.ModelViewSet):
-    """ViewSet for Attendance model"""
-    queryset = Attendance.objects.all()
+    queryset = Attendance.objects.select_related('student', 'course').all()
     serializer_class = AttendanceSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'course', 'status', 'date']
@@ -835,265 +448,380 @@ class AttendanceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def my_attendance(self, request):
-        """Get current student's attendance"""
         try:
             student = Student.objects.get(user=request.user)
             attendance = Attendance.objects.filter(student=student)
-            serializer = self.get_serializer(attendance, many=True)
-            return Response(serializer.data)
+            return Response(self.get_serializer(attendance, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Student profile not found'}, status=404)
 
 
 # ============= GRADE VIEWSET =============
 class GradeViewSet(viewsets.ModelViewSet):
-    """ViewSet for Grade model"""
-    queryset = Grade.objects.all()
+    queryset = Grade.objects.select_related('student', 'course').all()
     serializer_class = GradeSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'course', 'exam_type']
     search_fields = ['student__roll_number', 'course__code']
-    ordering_fields = ['exam_date', 'marks_obtained', 'percentage']
 
     @action(detail=False, methods=['get'])
     def my_grades(self, request):
-        """Get current student's grades"""
         try:
             student = Student.objects.get(user=request.user)
             grades = Grade.objects.filter(student=student)
-            serializer = self.get_serializer(grades, many=True)
-            return Response(serializer.data)
+            return Response(self.get_serializer(grades, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Student profile not found'}, status=404)
 
 
 # ============= FEE STRUCTURE VIEWSET =============
 class FeeStructureViewSet(viewsets.ModelViewSet):
-    """ViewSet for FeeStructure model"""
-    queryset = FeeStructure.objects.all()
+    queryset = FeeStructure.objects.select_related('department').all()
     serializer_class = FeeStructureSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['department', 'semester']
     ordering_fields = ['department', 'semester']
 
+    def get_permissions(self):
+        """Only admins can create/update/delete fee structures"""
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsAdmin()]
+        return [IsAuthenticated()]
+
 
 # ============= PAYMENT VIEWSET =============
 class PaymentViewSet(viewsets.ModelViewSet):
-    """ViewSet for Payment model"""
-    queryset = Payment.objects.all()
+    queryset = Payment.objects.select_related('student__user', 'fee_structure').all()
     serializer_class = PaymentSerializer
     permission_classes = [IsAuthenticated]
-    filterset_fields = ['student', 'status', 'payment_method', 'payment_date']
-    search_fields = ['student__roll_number', 'transaction_id']
-    ordering_fields = ['payment_date', 'status', 'amount_paid']
+    filterset_fields = ['student', 'status', 'payment_method']
+    search_fields = ['student__roll_number', 'transaction_id', 'razorpay_order_id']
+    ordering_fields = ['created_at', 'status', 'amount_due']
 
     @action(detail=False, methods=['get'])
     def my_payments(self, request):
         """Get current student's payments"""
         try:
             student = Student.objects.get(user=request.user)
-            payments = Payment.objects.filter(student=student)
-            serializer = self.get_serializer(payments, many=True)
-            return Response(serializer.data)
+            payments = Payment.objects.filter(student=student).order_by('-created_at')
+            return Response(self.get_serializer(payments, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Student profile not found'}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def create_razorpay_order(self, request, pk=None):
+        """Create a Razorpay order for this payment"""
+        payment = self.get_object()
+
+        if payment.status == 'COMPLETED':
+            return Response({'success': False, 'message': 'Payment already completed'}, status=400)
+
+        # Verify the student owns this payment (or is admin)
+        if not request.user.is_staff:
+            try:
+                student = Student.objects.get(user=request.user)
+                if payment.student != student:
+                    return Response({'success': False, 'message': 'Unauthorized'}, status=403)
+            except Student.DoesNotExist:
+                return Response({'success': False, 'message': 'Student profile not found'}, status=404)
+
+        # Amount in paise (Razorpay requires smallest currency unit)
+        balance = payment.amount_due - payment.amount_paid
+        amount_paise = int(balance * 100)
+
+        if amount_paise <= 0:
+            return Response({'success': False, 'message': 'No balance due'}, status=400)
+
+        try:
+            client = get_razorpay_client()
+            order_data = {
+                'amount': amount_paise,
+                'currency': 'INR',
+                'receipt': f'pay_{payment.id}_{uuid.uuid4().hex[:8]}',
+                'notes': {
+                    'payment_id': str(payment.id),
+                    'student_roll': payment.student.roll_number,
+                    'student_name': payment.student.user.get_full_name(),
+                }
+            }
+            razorpay_order = client.order.create(data=order_data)
+
+            # Save order id
+            payment.razorpay_order_id = razorpay_order['id']
+            payment.status = 'PROCESSING'
+            payment.save()
+
+            return Response({
+                'success': True,
+                'order_id': razorpay_order['id'],
+                'amount': amount_paise,
+                'currency': 'INR',
+                'key': settings.RAZORPAY_KEY_ID,
+                'payment_id': payment.id,
+                'student_name': payment.student.user.get_full_name(),
+                'remarks': payment.remarks or f'Fee Payment #{payment.id}',
+            })
+        except Exception as e:
+            return Response({'success': False, 'message': f'Failed to create order: {str(e)}'}, status=500)
+
+    @action(detail=True, methods=['post'])
+    def verify_payment(self, request, pk=None):
+        """Verify Razorpay payment signature and mark payment as completed"""
+        payment = self.get_object()
+        serializer = PaymentVerifySerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({'success': False, 'errors': serializer.errors}, status=400)
+
+        razorpay_order_id = serializer.validated_data['razorpay_order_id']
+        razorpay_payment_id = serializer.validated_data['razorpay_payment_id']
+        razorpay_signature = serializer.validated_data['razorpay_signature']
+
+        # Verify signature using HMAC SHA256
+        body = f"{razorpay_order_id}|{razorpay_payment_id}"
+        expected_signature = hmac.new(
+            settings.RAZORPAY_KEY_SECRET.encode('utf-8'),
+            body.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected_signature, razorpay_signature):
+            payment.status = 'FAILED'
+            payment.save()
+            return Response({'success': False, 'message': 'Payment verification failed — invalid signature'}, status=400)
+
+        # Mark payment as completed
+        with transaction.atomic():
+            payment.razorpay_payment_id = razorpay_payment_id
+            payment.razorpay_signature = razorpay_signature
+            payment.amount_paid = payment.amount_due
+            payment.status = 'COMPLETED'
+            payment.payment_method = 'RAZORPAY'
+            payment.payment_date = date.today()
+            payment.transaction_id = razorpay_payment_id
+            payment.save()
+
+            # Create notification for student
+            Notification.objects.create(
+                title='Payment Successful',
+                message=f'Your payment of Rs. {payment.amount_due} has been received. Transaction ID: {razorpay_payment_id}',
+                is_global=False,
+                recipient_type='INDIVIDUAL',
+                student=payment.student,
+            )
+
+        return Response({
+            'success': True,
+            'message': 'Payment verified and completed successfully',
+            'transaction_id': razorpay_payment_id,
+            'amount_paid': float(payment.amount_paid),
+            'payment': self.get_serializer(payment).data,
+        })
 
     @action(detail=True, methods=['post'])
     def send_notification(self, request, pk=None):
-        """Send payment notification to student"""
+        """Send payment reminder notification to student"""
         try:
             payment = self.get_object()
-            message = request.data.get('message', f'Your fee payment of Rs. {payment.amount_paid} is overdue. Please pay immediately.')
-            
-            # Create notification
-            notification = Notification.objects.create(
-                title='Payment Reminder',
+            if not request.user.is_staff:
+                return Response({'success': False, 'message': 'Admin access required'}, status=403)
+
+            message = request.data.get(
+                'message',
+                f'Your fee payment of Rs. {payment.amount_due} is overdue. Please pay immediately.'
+            )
+            Notification.objects.create(
+                title='Fee Payment Reminder',
                 message=message,
                 is_global=False,
-                recipient_type='INDIVIDUAL'
+                recipient_type='INDIVIDUAL',
+                student=payment.student,
             )
-            
-            # Link to student if available
-            if hasattr(payment, 'student') and payment.student:
-                # Create student notification entry if needed
-                pass
-            
-            return Response(
-                {'success': True, 'message': 'Notification sent successfully'},
-                status=status.HTTP_200_OK
-            )
+            return Response({'success': True, 'message': 'Notification sent successfully'})
         except Payment.DoesNotExist:
-            return Response({'detail': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Payment not found'}, status=404)
+
+    @action(detail=False, methods=['post'])
+    def bulk_create(self, request):
+        """Bulk create payment records for all students in a semester"""
+        if not request.user.is_staff:
+            return Response({'success': False, 'message': 'Admin access required'}, status=403)
+
+        semester = request.data.get('semester')
+        department_id = request.data.get('department_id')
+        due_date_str = request.data.get('due_date')
+        custom_amount = request.data.get('amount')
+
+        if not semester or not due_date_str:
+            return Response({'success': False, 'message': 'semester and due_date are required'}, status=400)
+
+        try:
+            due_date = date.fromisoformat(due_date_str)
+        except ValueError:
+            return Response({'success': False, 'message': 'Invalid due_date format (use YYYY-MM-DD)'}, status=400)
+
+        students_qs = Student.objects.filter(semester=semester, is_active=True, status='ACTIVE')
+        if department_id:
+            students_qs = students_qs.filter(department_id=department_id)
+
+        created, skipped = 0, 0
+        with transaction.atomic():
+            for student in students_qs:
+                # Get fee structure or use custom amount
+                fee_structure = FeeStructure.objects.filter(
+                    department=student.department, semester=semester
+                ).first()
+
+                amount = float(custom_amount) if custom_amount else (
+                    float(fee_structure.tuition_fee + fee_structure.lab_fee +
+                          fee_structure.library_fee + fee_structure.activity_fee +
+                          fee_structure.other_fee) if fee_structure else 0
+                )
+                if amount <= 0:
+                    skipped += 1
+                    continue
+
+                # Check if pending payment already exists for same semester
+                exists = Payment.objects.filter(
+                    student=student,
+                    fee_structure=fee_structure,
+                    status='PENDING'
+                ).exists()
+                if exists:
+                    skipped += 1
+                    continue
+
+                Payment.objects.create(
+                    student=student,
+                    fee_structure=fee_structure,
+                    amount_due=amount,
+                    amount_paid=0,
+                    due_date=due_date,
+                    status='PENDING',
+                    payment_method='ONLINE',
+                    remarks=f'Semester {semester} fees'
+                )
+                created += 1
+
+        return Response({
+            'success': True,
+            'message': f'Created {created} payment records, skipped {skipped}',
+            'created': created,
+            'skipped': skipped,
+        })
 
 
 # ============= BOOK VIEWSET =============
 class BookViewSet(viewsets.ModelViewSet):
-    """ViewSet for Book model"""
     queryset = Book.objects.all()
     serializer_class = BookSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['category', 'is_active']
     search_fields = ['title', 'author', 'isbn', 'publisher']
-    ordering_fields = ['title', 'author', 'publication_year']
 
 
 # ============= BOOK ISSUE VIEWSET =============
 class BookIssueViewSet(viewsets.ModelViewSet):
-    """ViewSet for BookIssue model"""
-    queryset = BookIssue.objects.all()
+    queryset = BookIssue.objects.select_related('student', 'book').all()
     serializer_class = BookIssueSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'book', 'status']
     search_fields = ['student__roll_number', 'book__title']
-    ordering_fields = ['issue_date', 'due_date', 'status']
 
     @action(detail=False, methods=['get'])
     def my_books(self, request):
-        """Get current student's issued books"""
         try:
             student = Student.objects.get(user=request.user)
             issues = BookIssue.objects.filter(student=student)
-            serializer = self.get_serializer(issues, many=True)
-            return Response(serializer.data)
+            return Response(self.get_serializer(issues, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Not found'}, status=404)
 
 
-# ============= HOSTEL VIEWSET =============
+# ============= HOSTEL VIEWSETS =============
 class HostelViewSet(viewsets.ModelViewSet):
-    """ViewSet for Hostel model"""
     queryset = Hostel.objects.all()
     serializer_class = HostelSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['hostel_type', 'is_active']
     search_fields = ['name', 'location', 'warden_name']
-    ordering_fields = ['name', 'capacity']
 
 
-# ============= ROOM VIEWSET =============
 class RoomViewSet(viewsets.ModelViewSet):
-    """ViewSet for Room model"""
-    queryset = Room.objects.all()
+    queryset = Room.objects.select_related('hostel').all()
     serializer_class = RoomSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['hostel', 'is_available']
     search_fields = ['hostel__name', 'room_number']
-    ordering_fields = ['hostel', 'floor', 'room_number']
 
 
-# ============= HOSTEL ALLOCATION VIEWSET =============
 class HostelAllocationViewSet(viewsets.ModelViewSet):
-    """ViewSet for HostelAllocation model"""
-    queryset = HostelAllocation.objects.all()
+    queryset = HostelAllocation.objects.select_related('student', 'room').all()
     serializer_class = HostelAllocationSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'room', 'status']
-    search_fields = ['student__roll_number']
-    ordering_fields = ['allocation_date', 'status']
 
     @action(detail=False, methods=['get'])
     def my_allocation(self, request):
-        """Get current student's hostel allocation"""
         try:
             student = Student.objects.get(user=request.user)
             allocation = HostelAllocation.objects.get(student=student)
-            serializer = self.get_serializer(allocation)
-            return Response(serializer.data)
-        except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
-        except HostelAllocation.DoesNotExist:
-            return Response({'detail': 'Hostel allocation not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(self.get_serializer(allocation).data)
+        except (Student.DoesNotExist, HostelAllocation.DoesNotExist):
+            return Response({'detail': 'Not found'}, status=404)
 
 
-# ============= HOSTEL FEE VIEWSET =============
 class HostelFeeViewSet(viewsets.ModelViewSet):
-    """ViewSet for HostelFee model"""
     queryset = HostelFee.objects.all()
     serializer_class = HostelFeeSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['student', 'status', 'month_year']
-    search_fields = ['student__roll_number']
-    ordering_fields = ['month_year', 'status']
 
     @action(detail=False, methods=['get'])
     def my_hostel_fees(self, request):
-        """Get current student's hostel fees"""
         try:
             student = Student.objects.get(user=request.user)
             fees = HostelFee.objects.filter(student=student)
-            serializer = self.get_serializer(fees, many=True)
-            return Response(serializer.data)
+            return Response(self.get_serializer(fees, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Not found'}, status=404)
 
 
-# ============= REGISTRATION OPTIONS ENDPOINTS =============
-
+# ============= REGISTRATION OPTIONS =============
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_registration_options(request):
-    """
-    Get dynamic options for registration form
-    Returns available roles, semesters, and other configurable options
-    """
-    options = {
-        'roles': [
-            {'value': 'user', 'label': 'General User', 'description': 'Basic user account'},
-            {'value': 'student', 'label': 'Student', 'description': 'Student account with academic features'},
-            {'value': 'faculty', 'label': 'Faculty', 'description': 'Faculty account with teaching features'},
-            {'value': 'admin', 'label': 'Administrator', 'description': 'Admin account with full system access'}
-        ],
-        'semesters': [
-            {'value': 1, 'label': 'Semester 1'},
-            {'value': 2, 'label': 'Semester 2'},
-            {'value': 3, 'label': 'Semester 3'},
-            {'value': 4, 'label': 'Semester 4'},
-            {'value': 5, 'label': 'Semester 5'},
-            {'value': 6, 'label': 'Semester 6'},
-            {'value': 7, 'label': 'Semester 7'},
-            {'value': 8, 'label': 'Semester 8'}
-        ],
-        'genders': [
-            {'value': 'M', 'label': 'Male'},
-            {'value': 'F', 'label': 'Female'},
-            {'value': 'O', 'label': 'Other'}
-        ],
-        'student_statuses': [
-            {'value': 'ACTIVE', 'label': 'Active'},
-            {'value': 'INACTIVE', 'label': 'Inactive'},
-            {'value': 'GRADUATED', 'label': 'Graduated'},
-            {'value': 'SUSPENDED', 'label': 'Suspended'}
-        ]
-    }
-
     return Response({
         'success': True,
-        'options': options
-    }, status=status.HTTP_200_OK)
+        'options': {
+            'roles': [
+                {'value': 'user', 'label': 'General User'},
+                {'value': 'student', 'label': 'Student'},
+                {'value': 'faculty', 'label': 'Faculty'},
+                {'value': 'admin', 'label': 'Administrator'},
+            ],
+            'semesters': [{'value': i, 'label': f'Semester {i}'} for i in range(1, 9)],
+            'genders': [
+                {'value': 'M', 'label': 'Male'},
+                {'value': 'F', 'label': 'Female'},
+                {'value': 'O', 'label': 'Other'}
+            ],
+        }
+    })
 
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_departments_list(request):
-    """
-    Get list of departments for registration dropdown
-    """
     departments = Department.objects.all().order_by('name')
-    data = [
-        {'id': dept.id, 'name': dept.name, 'code': dept.code}
-        for dept in departments
-    ]
-
     return Response({
         'success': True,
-        'departments': data
-    }, status=status.HTTP_200_OK)
+        'departments': [{'id': d.id, 'name': d.name, 'code': d.code} for d in departments]
+    })
 
 
 # ============= ASSIGNMENT VIEWSET =============
 class AssignmentViewSet(viewsets.ModelViewSet):
-    """ViewSet for Assignment model"""
-    queryset = Assignment.objects.all()
+    queryset = Assignment.objects.select_related('course', 'faculty__user').all()
     serializer_class = AssignmentSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['course', 'faculty']
@@ -1102,398 +830,197 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def my_course_assignments(self, request):
-        role = get_user_role(request.user)
-        if role == 'student':
-            try:
-                student = Student.objects.get(user=request.user)
-                enrollments = CourseEnrollment.objects.filter(student=student).values_list('course_id', flat=True)
-                assignments = Assignment.objects.filter(course_id__in=enrollments)
-                serializer = self.get_serializer(assignments, many=True)
-                return Response(serializer.data)
-            except Student.DoesNotExist:
-                return Response({'detail': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
-        elif role == 'faculty':
-            try:
-                faculty = Faculty.objects.get(user=request.user)
-                assignments = Assignment.objects.filter(faculty=faculty)
-                serializer = self.get_serializer(assignments, many=True)
-                return Response(serializer.data)
-            except Faculty.DoesNotExist:
-                return Response({'detail': 'Faculty not found'}, status=status.HTTP_404_NOT_FOUND)
-        return Response({'detail': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        """Get assignments for faculty's courses"""
+        try:
+            faculty = Faculty.objects.get(user=request.user)
+            assignments = Assignment.objects.filter(faculty=faculty)
+            return Response(self.get_serializer(assignments, many=True).data)
+        except Faculty.DoesNotExist:
+            return Response({'detail': 'Faculty profile not found'}, status=404)
 
 
 # ============= ASSIGNMENT SUBMISSION VIEWSET =============
 class AssignmentSubmissionViewSet(viewsets.ModelViewSet):
-    """ViewSet for AssignmentSubmission model"""
-    queryset = AssignmentSubmission.objects.all()
+    queryset = AssignmentSubmission.objects.select_related('assignment', 'student', 'reviewed_by').all()
     serializer_class = AssignmentSubmissionSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['assignment', 'student', 'status']
     search_fields = ['student__roll_number', 'assignment__title']
-    ordering_fields = ['submission_date', 'status']
 
     @action(detail=False, methods=['get'])
     def my_submissions(self, request):
-        """Get current student's submissions"""
         try:
             student = Student.objects.get(user=request.user)
-            submissions = AssignmentSubmission.objects.filter(student=student)
-            serializer = self.get_serializer(submissions, many=True)
-            return Response(serializer.data)
+            subs = AssignmentSubmission.objects.filter(student=student)
+            return Response(self.get_serializer(subs, many=True).data)
         except Student.DoesNotExist:
-            return Response({'detail': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Not found'}, status=404)
 
     @action(detail=False, methods=['get'])
     def course_submissions(self, request):
-        """Get all submissions for faculty's assignments"""
-        role = get_user_role(request.user)
-        if role == 'faculty':
-            try:
-                faculty = Faculty.objects.get(user=request.user)
-                assignments = Assignment.objects.filter(faculty=faculty)
-                submissions = AssignmentSubmission.objects.filter(assignment__in=assignments)
-                serializer = self.get_serializer(submissions, many=True)
-                return Response(serializer.data)
-            except Faculty.DoesNotExist:
-                return Response({'detail': 'Faculty not found'}, status=status.HTTP_404_NOT_FOUND)
-        return Response({'detail': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        """All submissions for faculty's courses"""
+        try:
+            faculty = Faculty.objects.get(user=request.user)
+            subs = AssignmentSubmission.objects.filter(assignment__faculty=faculty)
+            return Response(self.get_serializer(subs, many=True).data)
+        except Faculty.DoesNotExist:
+            return Response({'detail': 'Not found'}, status=404)
 
     @action(detail=True, methods=['post'])
     def approve_submission(self, request, pk=None):
-        """Approve an assignment submission with marks"""
-        from django.utils.timezone import now
-        
-        submission = self.get_object()
-        role = get_user_role(request.user)
-        
-        if role != 'faculty':
-            return Response({'detail': 'Only faculty can approve submissions'}, status=status.HTTP_403_FORBIDDEN)
-        
+        sub = self.get_object()
+        sub.status = 'APPROVED'
+        sub.feedback = request.data.get('feedback', '')
+        sub.marks_obtained = request.data.get('marks_obtained')
+        sub.reviewed_date = timezone.now()
         try:
-            faculty = Faculty.objects.get(user=request.user)
-            marks = request.data.get('marks_obtained')
-            feedback = request.data.get('feedback', '')
-            
-            if marks is None:
-                return Response({'error': 'marks_obtained is required'}, status=status.HTTP_400_BAD_REQUEST)
-            
-            submission.status = 'APPROVED'
-            submission.marks_obtained = marks
-            submission.feedback = feedback
-            submission.reviewed_by = faculty
-            submission.reviewed_date = now()
-            submission.save()
-            
-            serializer = self.get_serializer(submission)
-            return Response(serializer.data)
+            sub.reviewed_by = Faculty.objects.get(user=request.user)
         except Faculty.DoesNotExist:
-            return Response({'detail': 'Faculty profile not found'}, status=status.HTTP_404_NOT_FOUND)
+            pass
+        sub.save()
+        return Response({'success': True, 'message': 'Submission approved'})
 
     @action(detail=True, methods=['post'])
     def reject_submission(self, request, pk=None):
-        """Reject an assignment submission with feedback"""
-        from django.utils.timezone import now
-        
-        submission = self.get_object()
-        role = get_user_role(request.user)
-        
-        if role != 'faculty':
-            return Response({'detail': 'Only faculty can reject submissions'}, status=status.HTTP_403_FORBIDDEN)
-        
+        sub = self.get_object()
+        sub.status = 'REJECTED'
+        sub.feedback = request.data.get('feedback', '')
+        sub.reviewed_date = timezone.now()
         try:
-            faculty = Faculty.objects.get(user=request.user)
-            feedback = request.data.get('feedback', 'Please resubmit with corrections.')
-            
-            submission.status = 'REJECTED'
-            submission.feedback = feedback
-            submission.reviewed_by = faculty
-            submission.reviewed_date = now()
-            submission.save()
-            
-            serializer = self.get_serializer(submission)
-            return Response(serializer.data)
+            sub.reviewed_by = Faculty.objects.get(user=request.user)
         except Faculty.DoesNotExist:
-            return Response({'detail': 'Faculty profile not found'}, status=status.HTTP_404_NOT_FOUND)
-
-
-# ============= NOTIFICATION VIEWSET =============
-class NotificationViewSet(viewsets.ModelViewSet):
-    """ViewSet for Notification model"""
-    queryset = Notification.objects.all()
-    serializer_class = NotificationSerializer
-    permission_classes = [IsAuthenticated]
-    filterset_fields = ['course', 'faculty', 'is_global']
-    search_fields = ['title', 'message']
-    ordering_fields = ['created_at']
-    
-    @action(detail=False, methods=['get'])
-    def my_notifications(self, request):
-        role = get_user_role(request.user)
-        if role == 'student':
-            try:
-                student = Student.objects.get(user=request.user)
-                # Get notifications for courses, global, individual, semester-based, or department-based
-                enrollments = CourseEnrollment.objects.filter(student=student).values_list('course_id', flat=True)
-                notifications = (
-                    Notification.objects.filter(course_id__in=enrollments) |
-                    Notification.objects.filter(is_global=True) |
-                    Notification.objects.filter(recipient_type='ALL') |
-                    Notification.objects.filter(recipient_type='INDIVIDUAL', student=student) |
-                    Notification.objects.filter(recipient_type='SEMESTER', semester=student.semester) |
-                    Notification.objects.filter(recipient_type='DEPARTMENT', department=student.department)
-                )
-                serializer = self.get_serializer(notifications.distinct(), many=True)
-                return Response(serializer.data)
-            except Student.DoesNotExist:
-                return Response({'detail': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
-        elif role == 'faculty':
-            try:
-                faculty = Faculty.objects.get(user=request.user)
-                notifications = Notification.objects.filter(faculty=faculty) | Notification.objects.filter(is_global=True) | Notification.objects.filter(recipient_type='ALL')
-                serializer = self.get_serializer(notifications.distinct(), many=True)
-                return Response(serializer.data)
-            except Faculty.DoesNotExist:
-                return Response({'detail': 'Faculty not found'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(self.get_serializer(Notification.objects.filter(is_global=True), many=True).data)
-
-
-# ============= DASHBOARD STATS ENDPOINT =============
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_dashboard_stats(request):
-    """
-    Get dashboard statistics: total students, faculty, courses, and departments
-    """
-    try:
-        stats_data = {
-            'students': Student.objects.count(),
-            'faculty': Faculty.objects.count(),
-            'courses': Course.objects.filter(is_active=True).count(),
-            'departments': Department.objects.count(),
-        }
-        
-        return Response(
-            {
-                'success': True,
-                'data': stats_data
-            },
-            status=status.HTTP_200_OK
-        )
-    except Exception as e:
-        return Response(
-            {
-                'success': False,
-                'message': f'Error fetching dashboard stats: {str(e)}'
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+            pass
+        sub.save()
+        return Response({'success': True, 'message': 'Submission rejected'})
 
 
 # ============= TIMETABLE VIEWSET =============
 class TimetableViewSet(viewsets.ModelViewSet):
-    """ViewSet for Timetable model"""
-    queryset = Timetable.objects.all()
+    queryset = Timetable.objects.select_related('course').all()
     serializer_class = TimetableSerializer
     permission_classes = [IsAuthenticated]
     filterset_fields = ['course', 'day_of_week', 'is_active']
-    search_fields = ['course__code', 'course__name', 'classroom']
-    ordering_fields = ['day_of_week', 'start_time', 'course__name']
+    search_fields = ['course__name', 'course__code', 'classroom']
 
 
-# ============= ADMIN STUDENT ADD ENDPOINT =============
+# ============= NOTIFICATION VIEWSET =============
+class NotificationViewSet(viewsets.ModelViewSet):
+    queryset = Notification.objects.all()
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ['is_global', 'recipient_type', 'is_read']
+    search_fields = ['title', 'message']
+    ordering_fields = ['created_at']
+
+    @action(detail=False, methods=['get'])
+    def my_notifications(self, request):
+        """Get notifications for current student"""
+        try:
+            student = Student.objects.get(user=request.user)
+            notifications = Notification.objects.filter(
+                recipient_type='INDIVIDUAL', student=student
+            ) | Notification.objects.filter(
+                recipient_type='ALL'
+            ) | Notification.objects.filter(
+                recipient_type='GLOBAL'
+            ) | Notification.objects.filter(
+                recipient_type='SEMESTER', semester=student.semester
+            ) | Notification.objects.filter(
+                recipient_type='DEPARTMENT', department=student.department
+            )
+            notifications = notifications.distinct().order_by('-created_at')
+            return Response(self.get_serializer(notifications, many=True).data)
+        except Student.DoesNotExist:
+            # Return global notifs for non-students
+            notifications = Notification.objects.filter(is_global=True).order_by('-created_at')
+            return Response(self.get_serializer(notifications, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        notification = self.get_object()
+        notification.is_read = True
+        notification.save()
+        return Response({'success': True})
+
+
+# ============= DASHBOARD STATS =============
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_dashboard_stats(request):
+    return Response({
+        'success': True,
+        'stats': {
+            'total_students': Student.objects.filter(is_active=True).count(),
+            'total_faculty': Faculty.objects.filter(is_active=True).count(),
+            'total_courses': Course.objects.filter(is_active=True).count(),
+            'total_departments': Department.objects.count(),
+            'pending_payments': Payment.objects.filter(status='PENDING').count(),
+            'completed_payments': Payment.objects.filter(status='COMPLETED').count(),
+            'total_revenue': float(sum(
+                p.amount_paid for p in Payment.objects.filter(status='COMPLETED')
+            )),
+        }
+    })
+
+
+# ============= ADMIN: ADD STUDENT =============
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def add_student_admin(request):
-    """
-    Admin endpoint to add students directly without going through registration
-    """
     if not request.user.is_staff:
-        return Response(
-            {
-                'success': False,
-                'message': 'Only admin users can add students'
-            },
-            status=status.HTTP_403_FORBIDDEN
-        )
-    
+        return Response({'success': False, 'message': 'Admin access required'}, status=403)
+
+    data = request.data
+    required = ['username', 'email', 'first_name', 'last_name', 'password', 'roll_number',
+                'enrollment_number', 'department', 'semester']
+    for field in required:
+        if not data.get(field):
+            return Response({'success': False, 'message': f'{field} is required'}, status=400)
+
+    if User.objects.filter(username=data['username']).exists():
+        return Response({'success': False, 'message': 'Username already taken'}, status=400)
+
     try:
-        # Create user
-        user_data = {
-            'username': request.data.get('username'),
-            'email': request.data.get('email'),
-            'first_name': request.data.get('first_name'),
-            'last_name': request.data.get('last_name'),
-            'password': request.data.get('password'),
-            'password2': request.data.get('password'),
-        }
-        
-        user_serializer = UserCreateSerializer(data=user_data)
-        if not user_serializer.is_valid():
-            return Response(
-                {
-                    'success': False,
-                    'errors': user_serializer.errors
-                },
-                status=status.HTTP_400_BAD_REQUEST
+        with transaction.atomic():
+            user = User.objects.create_user(
+                username=data['username'], email=data['email'],
+                first_name=data['first_name'], last_name=data['last_name'],
+                password=data['password']
             )
-        
-        user = user_serializer.save()
-        
-        # Create student profile
-        department_id = request.data.get('department')
-        if not department_id:
-            user.delete()
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Department is required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
+            department_id = data.get('department')
+            if str(department_id).isdigit():
+                department = Department.objects.get(id=int(department_id))
+            else:
+                department = Department.objects.filter(name__iexact=department_id).first()
+                if not department:
+                    department = Department.objects.create(name=department_id, code=department_id[:10].upper())
+
+            Student.objects.create(
+                user=user,
+                roll_number=data['roll_number'],
+                enrollment_number=data['enrollment_number'],
+                department=department,
+                semester=data['semester'],
+                phone=data.get('phone', ''),
+                gender=data.get('gender', ''),
+                father_name=data.get('father_name', ''),
+                mother_name=data.get('mother_name', ''),
+                status='ACTIVE',
             )
-        
-        try:
-            department = Department.objects.get(id=department_id)
-        except Department.DoesNotExist:
-            user.delete()
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Invalid department'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        student = Student.objects.create(
-            user=user,
-            department=department,
-            roll_number=request.data.get('roll_number'),
-            enrollment_number=request.data.get('enrollment_number'),
-            semester=request.data.get('semester', 1),
-            status='ACTIVE'
-        )
-        
-        student_serializer = StudentSerializer(student)
-        return Response(
-            {
-                'success': True,
-                'message': 'Student added successfully',
-                'data': student_serializer.data
-            },
-            status=status.HTTP_201_CREATED
-        )
-    
+        return Response({'success': True, 'message': 'Student added successfully'}, status=201)
+    except Department.DoesNotExist:
+        return Response({'success': False, 'message': 'Invalid department'}, status=400)
     except Exception as e:
-        return Response(
-            {
-                'success': False,
-                'message': f'Error adding student: {str(e)}'
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({'success': False, 'message': str(e)}, status=400)
 
 
-# ============= ATTENDANCE BY SEMESTER ENDPOINT =============
+# ============= ATTENDANCE BY SEMESTER =============
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def attendance_by_semester(request):
-    """
-    Get attendance records filtered by semester
-    Admin can see all students' attendance for a semester
-    Faculty can see their course students' attendance
-    Students can see their own attendance
-    """
-    try:
-        semester = request.query_params.get('semester')
-        if not semester:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Semester parameter is required'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            semester = int(semester)
-            if semester < 1 or semester > 8:
-                raise ValueError("Invalid semester")
-        except ValueError:
-            return Response(
-                {
-                    'success': False,
-                    'message': 'Semester must be between 1 and 8'
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Get attendance data based on user role
-        role = get_user_role(request.user)
-        
-        if role == 'admin':
-            # Admin can see all attendance for the semester
-            students = Student.objects.filter(semester=semester)
-            attendance_records = Attendance.objects.filter(
-                student__semester=semester
-            ).select_related('student', 'course')
-        
-        elif role == 'faculty':
-            # Faculty can see attendance for their courses
-            try:
-                faculty = Faculty.objects.get(user=request.user)
-                courses = Course.objects.filter(instructor=faculty, semester=semester)
-                attendance_records = Attendance.objects.filter(
-                    course__in=courses
-                ).select_related('student', 'course')
-            except Faculty.DoesNotExist:
-                return Response(
-                    {
-                        'success': False,
-                        'message': 'Faculty profile not found'
-                    },
-                    status=status.HTTP_404_NOT_FOUND
-                )
-        
-        else:  # student
-            # Students can only see their own attendance
-            try:
-                student = Student.objects.get(user=request.user)
-                if student.semester != semester:
-                    return Response(
-                        {
-                            'success': False,
-                            'message': 'You can only view your own semester attendance'
-                        },
-                        status=status.HTTP_403_FORBIDDEN
-                    )
-                attendance_records = Attendance.objects.filter(
-                    student=student
-                ).select_related('student', 'course')
-            except Student.DoesNotExist:
-                return Response(
-                    {
-                        'success': False,
-                        'message': 'Student profile not found'
-                    },
-                    status=status.HTTP_404_NOT_FOUND
-                )
-        
-        serializer = AttendanceSerializer(attendance_records, many=True)
-        return Response(
-            {
-                'success': True,
-                'semester': semester,
-                'count': attendance_records.count(),
-                'data': serializer.data
-            },
-            status=status.HTTP_200_OK
-        )
-    
-    except Exception as e:
-        return Response(
-            {
-                'success': False,
-                'message': f'Error fetching attendance: {str(e)}'
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    semester = request.query_params.get('semester')
+    if not semester:
+        return Response({'success': False, 'message': 'semester parameter required'}, status=400)
+    attendance = Attendance.objects.filter(course__semester=semester).select_related('student', 'course')
+    serializer = AttendanceSerializer(attendance, many=True)
+    return Response({'success': True, 'attendance': serializer.data})

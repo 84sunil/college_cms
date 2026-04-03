@@ -3,10 +3,11 @@ import { Navbar } from './components/Navbar';
 import { AdminRoute, FacultyRoute, ProtectedRoute, StudentRoute } from './components/ProtectedRoute';
 import { AuthProvider } from './context/AuthContext';
 import { AdminAttendance } from './pages/AdminAttendance';
+import { AdminFeeStructure } from './pages/AdminFeeStructure';
 import { AdminNotifications } from './pages/AdminNotifications';
 import { AdminPayments } from './pages/AdminPayments';
+import { AttendanceManagement } from './pages/AttendanceManagement';
 import { AttendanceTracker } from './pages/AttendanceTracker';
-import { ChangePassword } from './pages/ChangePassword';
 import { Courses } from './pages/Courses';
 import { Dashboard } from './pages/Dashboard';
 import { Faculty } from './pages/Faculty';
@@ -16,7 +17,6 @@ import { FacultyGrades } from './pages/FacultyGrades';
 import { ForgotPassword } from './pages/ForgotPassword';
 import { Home } from './pages/Home';
 import { Login } from './pages/Login';
-import { Profile } from './pages/Profile';
 import { Register } from './pages/Register';
 import { ResetPassword } from './pages/ResetPassword';
 import { StudentAssignments } from './pages/StudentAssignments';
@@ -45,24 +45,6 @@ function App() {
             element={
               <ProtectedRoute>
                 <Dashboard />
-              </ProtectedRoute>
-            }
-          />
-          
-          <Route
-            path="/change-password"
-            element={
-              <ProtectedRoute>
-                <ChangePassword />
-              </ProtectedRoute>
-            }
-          />
-          
-          <Route
-            path="/profile"
-            element={
-              <ProtectedRoute>
-                <Profile />
               </ProtectedRoute>
             }
           />
@@ -122,6 +104,15 @@ function App() {
           />
 
           <Route
+            path="/admin-fee-structure"
+            element={
+              <AdminRoute>
+                <AdminFeeStructure />
+              </AdminRoute>
+            }
+          />
+
+          <Route
             path="/admin-notifications"
             element={
               <AdminRoute>
@@ -160,6 +151,16 @@ function App() {
             element={
               <FacultyRoute>
                 <FacultyAssignments />
+              </FacultyRoute>
+            }
+          />
+          
+          {/* UNIFIED FACULTY ATTENDANCE MANAGEMENT (CRUD) */}
+          <Route
+            path="/attendance-management"
+            element={
+              <FacultyRoute>
+                <AttendanceManagement />
               </FacultyRoute>
             }
           />

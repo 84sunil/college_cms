@@ -128,6 +128,14 @@ export const Navbar = () => {
                   </li>
                   <li>
                     <Link
+                      to="/admin-fee-structure"
+                      className={`nav-link ${isActive('/admin-fee-structure') ? 'active' : ''}`}
+                    >
+                      Fee Structure
+                    </Link>
+                  </li>
+                  <li>
+                    <Link
                       to="/admin-notifications"
                       className={`nav-link ${isActive('/admin-notifications') ? 'active' : ''}`}
                     >
@@ -168,6 +176,14 @@ export const Navbar = () => {
                       className={`nav-link ${isActive('/faculty-assignments') ? 'active' : ''}`}
                     >
                       Assignments
+                    </Link>
+                  </li>
+                  <li>
+                    <Link
+                      to="/attendance-management"
+                      className={`nav-link ${isActive('/attendance-management') ? 'active' : ''}`}
+                    >
+                      📊 Manage Attendance (CRUD)
                     </Link>
                   </li>
                 </>
@@ -256,11 +272,9 @@ export const Navbar = () => {
                   justifyContent: 'center',
                   overflow: 'hidden',
                   border: '2px solid white',
-                  cursor: 'pointer',
                   flexShrink: 0,
                 }}
-                onClick={() => navigate('/profile')}
-                title="Click to view/edit profile"
+                title="User profile picture"
               >
                 {profilePicture ? (
                   <img
@@ -286,12 +300,6 @@ export const Navbar = () => {
             </div>
             
             <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <button className="btn btn-secondary btn-sm" onClick={() => navigate('/profile')}>
-                👤 Profile
-              </button>
-              <button className="btn btn-secondary btn-sm" onClick={() => navigate('/change-password')}>
-                ⚙️ Password
-              </button>
               <button className="btn btn-secondary btn-sm" onClick={handleLogout}>
                 Logout
               </button>

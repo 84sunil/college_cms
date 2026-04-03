@@ -19,7 +19,7 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating new users"""
-    password = serializers.CharField(write_only=True, required=True)
+    password = serializers.CharField(write_only=True, required=True, min_length=8)
     password2 = serializers.CharField(write_only=True, required=True)
 
     class Meta:
@@ -54,10 +54,20 @@ class LogoutSerializer(serializers.Serializer):
 # ============= DEPARTMENT SERIALIZER =============
 class DepartmentSerializer(serializers.ModelSerializer):
     """Serializer for Department model"""
+    student_count = serializers.SerializerMethodField()
+    faculty_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Department
-        fields = ['id', 'name', 'code', 'head_of_department', 'description', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'code', 'head_of_department', 'description',
+                  'student_count', 'faculty_count', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_student_count(self, obj):
+        return obj.students.filter(is_active=True).count()
+
+    def get_faculty_count(self, obj):
+        return obj.faculty_members.filter(is_active=True).count()
 
 
 # ============= FACULTY SERIALIZER =============
@@ -81,15 +91,19 @@ class CourseSerializer(serializers.ModelSerializer):
     """Serializer for Course model"""
     department_name = serializers.CharField(source='department.name', read_only=True)
     instructor_name = serializers.CharField(source='instructor.user.get_full_name', read_only=True)
+    enrolled_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Course
         fields = [
             'id', 'name', 'code', 'department', 'department_name', 'semester',
             'credits', 'instructor', 'instructor_name', 'description', 'max_students',
-            'is_active', 'created_at', 'updated_at'
+            'enrolled_count', 'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_enrolled_count(self, obj):
+        return obj.enrollments.filter(status='ENROLLED').count()
 
 
 # ============= STUDENT SERIALIZER =============
@@ -114,11 +128,12 @@ class CourseEnrollmentSerializer(serializers.ModelSerializer):
     """Serializer for CourseEnrollment model"""
     student_name = serializers.CharField(source='student.user.get_full_name', read_only=True)
     course_code = serializers.CharField(source='course.code', read_only=True)
+    course_name = serializers.CharField(source='course.name', read_only=True)
 
     class Meta:
         model = CourseEnrollment
         fields = [
-            'id', 'student', 'student_name', 'course', 'course_code',
+            'id', 'student', 'student_name', 'course', 'course_code', 'course_name',
             'enrollment_date', 'status', 'grade', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'enrollment_date']
@@ -145,11 +160,12 @@ class AttendanceSerializer(serializers.ModelSerializer):
     """Serializer for Attendance model"""
     student_name = serializers.CharField(source='student.user.get_full_name', read_only=True)
     course_code = serializers.CharField(source='course.code', read_only=True)
+    course_name = serializers.CharField(source='course.name', read_only=True)
 
     class Meta:
         model = Attendance
         fields = [
-            'id', 'student', 'student_name', 'course', 'course_code',
+            'id', 'student', 'student_name', 'course', 'course_code', 'course_name',
             'date', 'status', 'remarks', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -160,11 +176,12 @@ class GradeSerializer(serializers.ModelSerializer):
     """Serializer for Grade model"""
     student_name = serializers.CharField(source='student.user.get_full_name', read_only=True)
     course_code = serializers.CharField(source='course.code', read_only=True)
+    course_name = serializers.CharField(source='course.name', read_only=True)
 
     class Meta:
         model = Grade
         fields = [
-            'id', 'student', 'student_name', 'course', 'course_code',
+            'id', 'student', 'student_name', 'course', 'course_code', 'course_name',
             'exam_type', 'marks_obtained', 'total_marks', 'percentage', 'grade',
             'exam_date', 'remarks', 'created_at', 'updated_at'
         ]
@@ -187,26 +204,49 @@ class FeeStructureSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_total_fee(self, obj):
-        return obj.tuition_fee + obj.lab_fee + obj.library_fee + obj.activity_fee + obj.other_fee
+        return float(obj.tuition_fee + obj.lab_fee + obj.library_fee + obj.activity_fee + obj.other_fee)
 
 
 # ============= PAYMENT SERIALIZER =============
 class PaymentSerializer(serializers.ModelSerializer):
     """Serializer for Payment model"""
     student_name = serializers.CharField(source='student.user.get_full_name', read_only=True)
+    student_roll = serializers.CharField(source='student.roll_number', read_only=True)
     balance_due = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
         fields = [
-            'id', 'student', 'student_name', 'fee_structure', 'amount_due', 'amount_paid',
-            'balance_due', 'payment_date', 'due_date', 'status', 'payment_method',
-            'transaction_id', 'remarks', 'created_at', 'updated_at'
+            'id', 'student', 'student_name', 'student_roll', 'fee_structure',
+            'amount_due', 'amount_paid', 'balance_due',
+            'payment_date', 'due_date', 'status', 'payment_method',
+            'transaction_id', 'remarks',
+            'razorpay_order_id', 'razorpay_payment_id',
+            'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'razorpay_order_id',
+                            'razorpay_payment_id', 'razorpay_signature']
 
     def get_balance_due(self, obj):
-        return obj.amount_due - obj.amount_paid
+        return float(obj.amount_due - obj.amount_paid)
+
+
+class RazorpayOrderSerializer(serializers.Serializer):
+    """Serializer for Razorpay order creation response"""
+    order_id = serializers.CharField()
+    amount = serializers.IntegerField()  # in paise
+    currency = serializers.CharField()
+    key = serializers.CharField()
+    payment_id = serializers.IntegerField()
+    student_name = serializers.CharField()
+    remarks = serializers.CharField(allow_blank=True)
+
+
+class PaymentVerifySerializer(serializers.Serializer):
+    """Serializer for Razorpay payment verification"""
+    razorpay_order_id = serializers.CharField(required=True)
+    razorpay_payment_id = serializers.CharField(required=True)
+    razorpay_signature = serializers.CharField(required=True)
 
 
 # ============= BOOK SERIALIZER =============
@@ -300,19 +340,20 @@ class HostelFeeSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_balance_due(self, obj):
-        return obj.amount_due - obj.amount_paid
+        return float(obj.amount_due - obj.amount_paid)
 
 
 # ============= ASSIGNMENT SERIALIZER =============
 class AssignmentSerializer(serializers.ModelSerializer):
     """Serializer for Assignment model"""
     course_name = serializers.CharField(source='course.name', read_only=True)
+    course_code = serializers.CharField(source='course.code', read_only=True)
     faculty_name = serializers.CharField(source='faculty.user.get_full_name', read_only=True)
 
     class Meta:
         model = Assignment
         fields = [
-            'id', 'course', 'course_name', 'faculty', 'faculty_name',
+            'id', 'course', 'course_name', 'course_code', 'faculty', 'faculty_name',
             'title', 'description', 'due_date', 'file_url',
             'created_at', 'updated_at'
         ]
@@ -344,12 +385,13 @@ class TimetableSerializer(serializers.ModelSerializer):
     """Serializer for Timetable model"""
     course_name = serializers.CharField(source='course.name', read_only=True)
     course_code = serializers.CharField(source='course.code', read_only=True)
+    instructor_name = serializers.CharField(source='course.instructor.user.get_full_name', read_only=True)
 
     class Meta:
         model = Timetable
         fields = [
-            'id', 'course', 'course_name', 'course_code', 'day_of_week',
-            'start_time', 'end_time', 'classroom', 'building', 'is_active',
+            'id', 'course', 'course_name', 'course_code', 'instructor_name',
+            'day_of_week', 'start_time', 'end_time', 'classroom', 'building', 'is_active',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
